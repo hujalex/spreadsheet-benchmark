@@ -3,22 +3,19 @@ import re
 import json
 import random
 import warnings
-import tinker
-import torch
 import asyncio
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from datasets import load_dataset
-from tinker import TensorData
-from tinker import types
-from tinker_cookbook.renderers import get_renderer, get_text_content
-from tinker_cookbook.utils.ml_log import setup_logging
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 import phoenix as px
 from phoenix.otel import register
 from opentelemetry import trace
+from openinference.semconv.trace import OpenInferenceSpanKindValues, SpanAttributes
 
 from credit_limit_policy import find_overextended_accounts, grade_overextended, _parse_pairs
 from grader import Grader
@@ -26,10 +23,38 @@ from grader import Grader
 METRICS_DIR = "metrics"
 
 load_dotenv()
-TINKER_API_KEY = os.getenv("TINKER_API_KEY")
-MODEL_NAME = 'Qwen/Qwen3.6-35B-A3B'
-# MODEL_NAME = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
-RENDERER = 'qwen3_disable_thinking'
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+MODEL_NAME = "gemini-2.5-flash"
+PHOENIX_PROJECT_NAME = os.getenv("PHOENIX_PROJECT_NAME", "spreadsheet-agent-benchmark-gemini")
+PHOENIX_ENDPOINT = os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006/v1/traces")
+
+
+def _normalize_phoenix_endpoint(endpoint: str) -> str:
+    endpoint = endpoint.rstrip("/")
+    if endpoint.endswith("/v1/traces"):
+        return endpoint
+    return f"{endpoint}/v1/traces"
+
+
+def setup_phoenix_tracing():
+    endpoint = _normalize_phoenix_endpoint(PHOENIX_ENDPOINT)
+    session = None
+    launch_requested = os.getenv("PHOENIX_LAUNCH_APP", "1") != "0"
+    local_endpoint = "localhost" in endpoint or "127.0.0.1" in endpoint
+    if launch_requested and local_endpoint:
+        session = px.launch_app()
+        print(f"Phoenix UI: {session.url}")
+
+    register(
+        project_name=PHOENIX_PROJECT_NAME,
+        endpoint=endpoint,
+        protocol="http/protobuf",
+        auto_instrument=False,
+        batch=True,
+        api_key=os.getenv("PHOENIX_API_KEY") or os.getenv("ARIZE_PHOENIX_API_KEY"),
+    )
+    print(f"Phoenix tracing: project={PHOENIX_PROJECT_NAME}, endpoint={endpoint}")
+    return session
 
 class Model:
     # ds = load_dataset("xw27/scibench")
@@ -37,22 +62,18 @@ class Model:
     fin_tr_transactions = pd.read_csv("data/transactions_data.csv")
     fin_tr_users = pd.read_csv("data/users_data.csv")
     
-    def __init__(self, model, renderer, log_dir: str = "logs/run"):
+    def __init__(self, model, log_dir: str = "logs/gemini_run"):
         self.base_model = model
-        self.service_client = tinker.ServiceClient()
-        self.training_client = self.service_client.create_lora_training_client(
-            base_model=model, rank=32
+        if not GEMINI_API_KEY:
+            raise RuntimeError("Set GEMINI_API_KEY or GOOGLE_API_KEY before running main_gemini.py")
+        self.client = genai.Client(api_key=GEMINI_API_KEY)
+        self.generation_config = types.GenerateContentConfig(
+            max_output_tokens=8192,
+            temperature=0.2,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
         )
-        self.tokenizer = self.training_client.get_tokenizer()
-        self.renderer = get_renderer(renderer, self.tokenizer)
-        self.sampling_params = tinker.SamplingParams(
-            max_tokens=2048,
-            stop=self.renderer.get_stop_sequences(),
-        )
-        self.adam_params = tinker.AdamParams(learning_rate=4e-5, beta1=0.9, beta2=0.95)
         self.training_data = Model.fin_tr_transactions
         self.tracer = trace.get_tracer(__name__)
-        self.ml_logger = setup_logging(log_dir=log_dir)
         # Model.merge_cards_transactions(Model.fin_tr_cards, Model.fin_tr_transactions)
 
     @staticmethod
@@ -75,55 +96,78 @@ class Model:
         state_means = transactions.dropna(subset=['merchant_state']).groupby('merchant_state')['amount'].mean().nlargest(1)
         return state_means.index[0], f"{float(state_means.iloc[0]):.2f}"
 
-    async def train(self, n_steps=10, batch_size=15, group_size=8):
+    @staticmethod
+    def _set_span_kind(span, kind: OpenInferenceSpanKindValues) -> None:
+        span.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, kind.value)
+
+    async def train(self, n_steps=1, batch_size=3, group_size=1):
         metrics_history = []
         instance_metrics: list[dict] = []
         failures: list[dict] = []
         per_task = batch_size // 3
         for step in range(n_steps):
             with self.tracer.start_as_current_span(f"step_{step}") as step_span:
+                self._set_span_kind(step_span, OpenInferenceSpanKindValues.CHAIN)
                 step_span.set_attribute("step", step)
+                step_span.set_attribute("batch_size", batch_size)
+                step_span.set_attribute("group_size", group_size)
                 self.save_state()
 
-                examples = self._build_batch(step, per_task)
-                sample_results = await asyncio.gather(*[
-                    self.sampling_client.sample_async(
-                        prompt=ex["prompt"],
-                        num_samples=group_size,
-                        sampling_params=self.sampling_params,
-                    )
-                    for ex in examples
-                ])
+                with self.tracer.start_as_current_span("build_batch") as batch_span:
+                    self._set_span_kind(batch_span, OpenInferenceSpanKindValues.TOOL)
+                    batch_span.set_attribute("step", step)
+                    batch_span.set_attribute("per_task", per_task)
+                    examples = self._build_batch(step, per_task)
+                    batch_span.set_attribute("output.value", json.dumps({
+                        "n_examples": len(examples),
+                        "tasks": [ex["task"] for ex in examples],
+                    }))
 
-                datums: list[tinker.Datum] = []
                 rewards: list[float] = []
                 rewards_by_task: dict[str, list[float]] = {"merge": [], "policy": [], "memo": []}
                 n_degenerate = 0
-                n_skipped_empty = 0
 
-                for i, (ex, sample_result) in enumerate(zip(examples, sample_results)):
+                for i, ex in enumerate(examples):
                     with self.tracer.start_as_current_span("example") as span:
+                        self._set_span_kind(span, OpenInferenceSpanKindValues.CHAIN)
                         span.set_attribute("step", step)
                         span.set_attribute("example_index", i)
                         span.set_attribute("task", ex["task"])
                         span.set_attribute("input.value", ex["question"])
 
-                        contents_group, rewards_group = [], []
-                        tokens_group, logprobs_group = [], []
+                        sample_result = await self.sample_async(
+                            ex["prompt"],
+                            group_size,
+                            step=step,
+                            example_index=i,
+                            task=ex["task"],
+                        )
 
-                        for sample_idx, sequence in enumerate(sample_result.sequences):
-                            tokens_group.append(sequence.tokens)
-                            logprobs_group.append(sequence.logprobs)
-                            parsed_message, _ = self.renderer.parse_response(sequence.tokens)
-                            content = get_text_content(parsed_message)
+                        contents_group, rewards_group = [], []
+                        for sample_idx, sample in enumerate(sample_result):
+                            content = sample["text"]
                             if ex.get("prefill"):
-                                content = ex["prefill"] + content
+                                content = self._apply_prefill(content, ex["prefill"])
                             contents_group.append(content)
                             if ex['task'] == 'policy':
                                 print(content)
-                            reward = Grader._grade(content, ex, n_tokens=len(sequence.tokens))
+                            with self.tracer.start_as_current_span("grade_response") as grade_span:
+                                self._set_span_kind(grade_span, OpenInferenceSpanKindValues.EVALUATOR)
+                                grade_span.set_attribute("step", step)
+                                grade_span.set_attribute("example_index", i)
+                                grade_span.set_attribute("sample_index", sample_idx)
+                                grade_span.set_attribute("task", ex["task"])
+                                grade_span.set_attribute("input.value", content)
+                                reward = Grader._grade(
+                                    content,
+                                    ex,
+                                    n_tokens=self._estimate_token_count(content),
+                                )
+                                grade_span.set_attribute("reward", reward)
+                                grade_span.set_attribute("output.value", str(reward))
                             rewards_group.append(reward)
                             if reward < 1.0:
+                                annotation = self._annotate_failure(ex, content)
                                 failures.append({
                                     "step": step,
                                     "example_index": i,
@@ -132,7 +176,10 @@ class Model:
                                     "reward": reward,
                                     "response": content,
                                     "ground_truth": ex["ground_truth"],
-                                    "annotation": self._annotate_failure(ex, content),
+                                    "annotation": annotation,
+                                    "finish_reason": sample["finish_reason"],
+                                    "finish_message": sample["finish_message"],
+                                    "output_tokens": sample["output_tokens"],
                                 })
 
                         mean_reward = sum(rewards_group) / len(rewards_group)
@@ -163,16 +210,6 @@ class Model:
                             n_degenerate += 1
                             continue
 
-                        ob_len = ex["prompt"].length - 1
-                        for tokens, logprobs, advantage in zip(tokens_group, logprobs_group, advantages_group):
-                            if len(tokens) <= 1:
-                                n_skipped_empty += 1
-                                continue
-                            model_input = ex["prompt"].append(tinker.EncodedTextChunk(tokens=tokens[:-1]))
-                            datums.append(self.build_datum(model_input, tokens, logprobs, advantage, ob_len))
-
-                self.update(datums)
-
                 merge_mean = sum(rewards_by_task["merge"]) / max(len(rewards_by_task["merge"]), 1)
                 policy_mean = sum(rewards_by_task["policy"]) / max(len(rewards_by_task["policy"]), 1)
                 memo_mean = sum(rewards_by_task["memo"]) / max(len(rewards_by_task["memo"]), 1)
@@ -181,8 +218,6 @@ class Model:
                 step_span.set_attribute("reward.policy_mean", policy_mean)
                 step_span.set_attribute("reward.memo_mean", memo_mean)
                 step_span.set_attribute("frac_degenerate", n_degenerate / len(rewards))
-                step_span.set_attribute("n_datums", len(datums))
-                step_span.set_attribute("n_skipped_empty", n_skipped_empty)
 
             mean_reward = sum(rewards) / len(rewards)
             frac_degenerate = n_degenerate / len(rewards)
@@ -194,8 +229,7 @@ class Model:
             print(
                 f"Step {step:2d} | reward: {mean_reward:.3f} "
                 f"(merge {merge_mean:.3f}, policy {policy_mean:.3f}, memo {memo_mean:.3f}) | "
-                f"degenerate: {frac_degenerate:.0%} | datums: {len(datums)} | "
-                f"skipped empty: {n_skipped_empty}"
+                f"degenerate: {frac_degenerate:.0%}"
             )
 
         self._write_metrics(metrics_history, instance_metrics)
@@ -296,7 +330,7 @@ class Model:
 
     def _write_failures_markdown(self, failures: list[dict]) -> None:
         os.makedirs(METRICS_DIR, exist_ok=True)
-        md_path = os.path.join(METRICS_DIR, "rubric.md")
+        md_path = os.path.join(METRICS_DIR, "rubric_gemini.md")
         by_task: dict[str, list[dict]] = {}
         for f in failures:
             by_task.setdefault(f["task"], []).append(f)
@@ -319,6 +353,14 @@ class Model:
                 )
                 lines.append("")
                 lines.append(f"**Annotation:** {f['annotation']}")
+                if f.get("finish_reason") or f.get("output_tokens") is not None:
+                    lines.append("")
+                    lines.append(
+                        f"**Generation:** finish_reason={f.get('finish_reason')}, "
+                        f"output_tokens={f.get('output_tokens')}"
+                    )
+                    if f.get("finish_message"):
+                        lines.append(f"finish_message={f['finish_message']}")
                 lines.append("")
                 lines.append("**Ground truth:**")
                 lines.append("```")
@@ -335,7 +377,109 @@ class Model:
         print(f"Wrote {md_path}")
 
     def save_state(self):
-        self.sampling_client = self.training_client.save_weights_and_get_sampling_client()
+        pass
+
+    async def sample_async(
+        self,
+        prompt: str,
+        num_samples: int,
+        *,
+        step: int | None = None,
+        example_index: int | None = None,
+        task: str | None = None,
+    ) -> list[dict]:
+        return await asyncio.gather(
+            *[
+                asyncio.to_thread(
+                    self._generate_with_metadata,
+                    prompt,
+                    sample_index=sample_index,
+                    step=step,
+                    example_index=example_index,
+                    task=task,
+                )
+                for sample_index in range(num_samples)
+            ]
+        )
+
+    def _generate_content(self, prompt: str) -> str:
+        return self._generate_with_metadata(prompt)["text"]
+
+    def _generate_with_metadata(
+        self,
+        prompt: str,
+        *,
+        sample_index: int | None = None,
+        step: int | None = None,
+        example_index: int | None = None,
+        task: str | None = None,
+    ) -> dict:
+        with self.tracer.start_as_current_span("gemini.generate_content") as span:
+            self._set_span_kind(span, OpenInferenceSpanKindValues.LLM)
+            span.set_attribute("llm.provider", "google")
+            span.set_attribute("llm.model_name", self.base_model)
+            span.set_attribute("input.value", prompt)
+            if step is not None:
+                span.set_attribute("step", step)
+            if example_index is not None:
+                span.set_attribute("example_index", example_index)
+            if sample_index is not None:
+                span.set_attribute("sample_index", sample_index)
+            if task:
+                span.set_attribute("task", task)
+            span.set_attribute(
+                "llm.invocation_parameters",
+                json.dumps({
+                    "max_output_tokens": 8192,
+                    "temperature": 0.2,
+                    "thinking_budget": 0,
+                }),
+            )
+            try:
+                response = self.client.models.generate_content(
+                    model=self.base_model,
+                    contents=prompt,
+                    config=self.generation_config,
+                )
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_attribute("error", True)
+                raise
+
+            candidate = response.candidates[0] if response.candidates else None
+            usage = response.usage_metadata
+            text = response.text or ""
+            finish_reason = str(candidate.finish_reason) if candidate and candidate.finish_reason else None
+            output_tokens = usage.candidates_token_count if usage else None
+
+            span.set_attribute("output.value", text)
+            if finish_reason:
+                span.set_attribute("llm.finish_reason", finish_reason)
+            if candidate and candidate.finish_message:
+                span.set_attribute("llm.finish_message", candidate.finish_message)
+            if usage:
+                if usage.prompt_token_count is not None:
+                    span.set_attribute("llm.token_count.prompt", usage.prompt_token_count)
+                if usage.candidates_token_count is not None:
+                    span.set_attribute("llm.token_count.completion", usage.candidates_token_count)
+                if usage.total_token_count is not None:
+                    span.set_attribute("llm.token_count.total", usage.total_token_count)
+
+            return {
+                "text": text,
+                "finish_reason": finish_reason,
+                "finish_message": candidate.finish_message if candidate else None,
+                "output_tokens": output_tokens,
+            }
+
+    @staticmethod
+    def _apply_prefill(content: str, prefill: str) -> str:
+        content = content.lstrip()
+        return content if content.startswith(prefill) else prefill + content
+
+    @staticmethod
+    def _estimate_token_count(content: str) -> int:
+        return max(1, len(content.split()))
 
     def _build_batch(self, step: int, per_task: int) -> list[dict]:
         """Build a 3-way mixed batch: `per_task` merge + `per_task` policy + `per_task` memo."""
@@ -380,8 +524,7 @@ class Model:
             f"Transaction: {transaction.to_json()}\n\n"
             f"Cards: {cards_slice.to_json(orient='records')}"
         )
-        convo = [{"role": "user", "content": question}]
-        prompt = self.renderer.build_generation_prompt(convo, prefill="{")
+        prompt = question
 
         gt_row = Model.merge_cards_transactions(
             cards, pd.DataFrame([transaction])
@@ -412,8 +555,7 @@ class Model:
         f"Cards: {cards_chunk.to_json(orient='records')}\n\n"
         "### OUTPUT:"
         )
-        convo = [{"role": "user", "content": question}]
-        prompt = self.renderer.build_generation_prompt(convo)
+        prompt = question
         
         # * ground truth
         ground_truth = find_overextended_accounts(users_chunk, cards_chunk)
@@ -432,8 +574,7 @@ class Model:
             "\\boxed{...}. The two boxes may appear anywhere in the memo.\n\n"
             f"Transactions: {transactions.to_json(orient='records')}"
         )
-        convo = [{"role": "user", "content": question}]
-        prompt = self.renderer.build_generation_prompt(convo)
+        prompt = question
 
         # * ground truth
         state, avg_amount = Model.get_state_largest_mean_transaction(transactions)
@@ -442,50 +583,22 @@ class Model:
         return {"task": "memo", "prompt": prompt, "question": question,
                 "ground_truth": ground_truth}
 
-
-    def build_datum(self, model_input, tokens, logprobs, advantage, ob_len):
-        target_tokens = [0] * ob_len + list(tokens)
-        padded_logprobs = [0.0] * ob_len + list(logprobs)
-        padded_advantages = [0.0] * ob_len + [advantage] * (model_input.length - ob_len)
-        datum = tinker.Datum(
-            model_input=model_input,
-            loss_fn_inputs={
-                "target_tokens":
-                    TensorData.from_torch(torch.tensor(target_tokens)),
-                "logprobs":
-                    TensorData.from_torch(torch.tensor(padded_logprobs)),
-                "advantages":
-                    TensorData.from_torch(torch.tensor(padded_advantages)),
-            },
-        )
-        return datum
-
-    def update(self, datums):
-        if len(datums) > 0:
-            fwd_bwd_future = self.training_client.forward_backward(datums, loss_fn="importance_sampling")
-            optim_future = self.training_client.optim_step(self.adam_params) 
-            fwd_bwd_future.result()
-            optim_future.result()
-            
     def prompt(self, question):
-        result = self.sampling_client.sample(
-            prompt=question, num_samples=1, sampling_params=self.sampling_params
-        ).result()
-        print(self.tokenizer.decode(result.sequences[0].tokens))
+        print(self._generate_content(question))
 
 
 if __name__ == "__main__":
-    # session = px.launch_app()
-    # print(f"Phoenix UI: {session.url}")
-    # register(
-    #     project_name="spreadsheet-agent-benchmark",
-    #     endpoint="http://localhost:6006/v1/traces",
-    #     protocol="http/protobuf",
-    #     auto_instrument=False,
-    # )
-
-    model = Model(MODEL_NAME, RENDERER)
-    asyncio.run(model.train())
+    session = setup_phoenix_tracing()
+    model = Model(MODEL_NAME)
+    tracer = trace.get_tracer(__name__)
+    with tracer.start_as_current_span("gemini_agent_run") as span:
+        span.set_attribute(
+            SpanAttributes.OPENINFERENCE_SPAN_KIND,
+            OpenInferenceSpanKindValues.AGENT.value,
+        )
+        span.set_attribute("agent.name", "spreadsheet-agent-benchmark-gemini")
+        span.set_attribute("llm.model_name", MODEL_NAME)
+        asyncio.run(model.train())
     # model.prompt("A 10 kg body moving at sticks to a 15 kg body at rest. What is the final velocity?")
     input("Training complete. Press Enter to shut down Phoenix and exit...")
     
