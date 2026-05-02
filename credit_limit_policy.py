@@ -80,6 +80,29 @@ def grade_overextended(response: str, ground_truth: str) -> float:
     return 1.0 if pred == gold else 0.0
 
 
+def grade_overextended_partial(response: str, ground_truth: str) -> float:
+    """Partial-credit policy grade normalized to a maximum score of 1.0.
+
+    Scoring:
+    - +1 for each response pair that matches the ground truth.
+    - -1 for each response pair not found in the ground truth.
+    - +0 for each ground-truth pair not found in the response.
+
+    Duplicate response entries are treated as separate entries, so repeating a
+    correct pair more times than it appears in the ground truth is penalized.
+    """
+    pred = Counter(_parse_pairs(response))
+    gold = Counter(_parse_pairs(ground_truth))
+
+    if not gold:
+        return 1.0 if not pred else 0.0
+
+    matches = sum((pred & gold).values())
+    extraneous = sum((pred - gold).values())
+    score = (matches - extraneous) / sum(gold.values())
+    return max(0.0, min(1.0, score))
+
+
 if __name__ == "__main__":
     users = pd.read_csv("data/users_data.csv")
     cards = pd.read_csv("data/cards_data.csv")
