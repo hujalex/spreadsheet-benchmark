@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 import phoenix as px
 from phoenix.otel import register
 from opentelemetry import trace
+from openinference.semconv.trace import OpenInferenceSpanKindValues, SpanAttributes
 
 from credit_limit_policy import find_overextended_accounts, grade_overextended, _parse_pairs
 from grader import Grader
@@ -30,6 +31,36 @@ TINKER_API_KEY = os.getenv("TINKER_API_KEY")
 MODEL_NAME = 'Qwen/Qwen3.6-35B-A3B'
 # MODEL_NAME = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
 RENDERER = 'qwen3_disable_thinking'
+PHOENIX_PROJECT_NAME = os.getenv("PHOENIX_PROJECT_NAME", "spreadsheet-agent-benchmark-tinker")
+PHOENIX_ENDPOINT = os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006/v1/traces")
+
+
+def _normalize_phoenix_endpoint(endpoint: str) -> str:
+    endpoint = endpoint.rstrip("/")
+    if endpoint.endswith("/v1/traces"):
+        return endpoint
+    return f"{endpoint}/v1/traces"
+
+
+def setup_phoenix_tracing():
+    endpoint = _normalize_phoenix_endpoint(PHOENIX_ENDPOINT)
+    session = None
+    launch_requested = os.getenv("PHOENIX_LAUNCH_APP", "1") != "0"
+    local_endpoint = "localhost" in endpoint or "127.0.0.1" in endpoint
+    if launch_requested and local_endpoint:
+        session = px.launch_app()
+        print(f"Phoenix UI: {session.url}")
+
+    register(
+        project_name=PHOENIX_PROJECT_NAME,
+        endpoint=endpoint,
+        protocol="http/protobuf",
+        auto_instrument=False,
+        batch=True,
+        api_key=os.getenv("PHOENIX_API_KEY") or os.getenv("ARIZE_PHOENIX_API_KEY"),
+    )
+    print(f"Phoenix tracing: project={PHOENIX_PROJECT_NAME}, endpoint={endpoint}")
+    return session
 
 class Model:
     # ds = load_dataset("xw27/scibench")
@@ -75,6 +106,10 @@ class Model:
         state_means = transactions.dropna(subset=['merchant_state']).groupby('merchant_state')['amount'].mean().nlargest(1)
         return state_means.index[0], f"{float(state_means.iloc[0]):.2f}"
 
+    @staticmethod
+    def _set_span_kind(span, kind: OpenInferenceSpanKindValues) -> None:
+        span.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, kind.value)
+
     async def train(self, n_steps=10, batch_size=15, group_size=8):
         metrics_history = []
         instance_metrics: list[dict] = []
@@ -82,17 +117,29 @@ class Model:
         per_task = batch_size // 3
         for step in range(n_steps):
             with self.tracer.start_as_current_span(f"step_{step}") as step_span:
+                self._set_span_kind(step_span, OpenInferenceSpanKindValues.CHAIN)
                 step_span.set_attribute("step", step)
+                step_span.set_attribute("batch_size", batch_size)
+                step_span.set_attribute("group_size", group_size)
                 self.save_state()
 
-                examples = self._build_batch(step, per_task)
+                with self.tracer.start_as_current_span("build_batch") as batch_span:
+                    self._set_span_kind(batch_span, OpenInferenceSpanKindValues.TOOL)
+                    batch_span.set_attribute("step", step)
+                    batch_span.set_attribute("per_task", per_task)
+                    examples = self._build_batch(step, per_task)
+                    batch_span.set_attribute("output.value", json.dumps({
+                        "n_examples": len(examples),
+                        "tasks": [ex["task"] for ex in examples],
+                    }))
                 sample_results = await asyncio.gather(*[
-                    self.sampling_client.sample_async(
-                        prompt=ex["prompt"],
-                        num_samples=group_size,
-                        sampling_params=self.sampling_params,
+                    self.sample_example_async(
+                        ex,
+                        group_size=group_size,
+                        step=step,
+                        example_index=i,
                     )
-                    for ex in examples
+                    for i, ex in enumerate(examples)
                 ])
 
                 datums: list[tinker.Datum] = []
@@ -103,6 +150,7 @@ class Model:
 
                 for i, (ex, sample_result) in enumerate(zip(examples, sample_results)):
                     with self.tracer.start_as_current_span("example") as span:
+                        self._set_span_kind(span, OpenInferenceSpanKindValues.CHAIN)
                         span.set_attribute("step", step)
                         span.set_attribute("example_index", i)
                         span.set_attribute("task", ex["task"])
@@ -121,7 +169,16 @@ class Model:
                             contents_group.append(content)
                             if ex['task'] == 'policy':
                                 print(content)
-                            reward = Grader._grade(content, ex, n_tokens=len(sequence.tokens))
+                            with self.tracer.start_as_current_span("grade_response") as grade_span:
+                                self._set_span_kind(grade_span, OpenInferenceSpanKindValues.EVALUATOR)
+                                grade_span.set_attribute("step", step)
+                                grade_span.set_attribute("example_index", i)
+                                grade_span.set_attribute("sample_index", sample_idx)
+                                grade_span.set_attribute("task", ex["task"])
+                                grade_span.set_attribute("input.value", content)
+                                reward = Grader._grade(content, ex, n_tokens=len(sequence.tokens))
+                                grade_span.set_attribute("reward", reward)
+                                grade_span.set_attribute("output.value", str(reward))
                             rewards_group.append(reward)
                             if reward < 1.0:
                                 failures.append({
@@ -335,7 +392,55 @@ class Model:
         print(f"Wrote {md_path}")
 
     def save_state(self):
-        self.sampling_client = self.training_client.save_weights_and_get_sampling_client()
+        with self.tracer.start_as_current_span("save_weights") as span:
+            self._set_span_kind(span, OpenInferenceSpanKindValues.TOOL)
+            span.set_attribute("llm.model_name", self.base_model)
+            self.sampling_client = self.training_client.save_weights_and_get_sampling_client()
+
+    async def sample_example_async(
+        self,
+        ex: dict,
+        *,
+        group_size: int,
+        step: int,
+        example_index: int,
+    ):
+        with self.tracer.start_as_current_span("tinker.sample") as span:
+            self._set_span_kind(span, OpenInferenceSpanKindValues.LLM)
+            span.set_attribute("llm.provider", "tinker")
+            span.set_attribute("llm.model_name", self.base_model)
+            span.set_attribute("step", step)
+            span.set_attribute("example_index", example_index)
+            span.set_attribute("task", ex["task"])
+            span.set_attribute("input.value", ex["question"])
+            span.set_attribute(
+                "llm.invocation_parameters",
+                json.dumps({
+                    "max_tokens": self.sampling_params.max_tokens,
+                    "num_samples": group_size,
+                    "renderer": RENDERER,
+                }),
+            )
+            try:
+                result = await self.sampling_client.sample_async(
+                    prompt=ex["prompt"],
+                    num_samples=group_size,
+                    sampling_params=self.sampling_params,
+                )
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_attribute("error", True)
+                raise
+
+            span.set_attribute("llm.num_completions", len(result.sequences))
+            for sample_idx, sequence in enumerate(result.sequences):
+                parsed_message, _ = self.renderer.parse_response(sequence.tokens)
+                content = get_text_content(parsed_message)
+                if ex.get("prefill"):
+                    content = ex["prefill"] + content
+                span.set_attribute(f"output.{sample_idx}.value", content)
+                span.set_attribute(f"output.{sample_idx}.token_count", len(sequence.tokens))
+            return result
 
     def _build_batch(self, step: int, per_task: int) -> list[dict]:
         """Build a 3-way mixed batch: `per_task` merge + `per_task` policy + `per_task` memo."""
@@ -462,10 +567,21 @@ class Model:
 
     def update(self, datums):
         if len(datums) > 0:
-            fwd_bwd_future = self.training_client.forward_backward(datums, loss_fn="importance_sampling")
-            optim_future = self.training_client.optim_step(self.adam_params) 
-            fwd_bwd_future.result()
-            optim_future.result()
+            with self.tracer.start_as_current_span("tinker.update") as span:
+                self._set_span_kind(span, OpenInferenceSpanKindValues.TOOL)
+                span.set_attribute("n_datums", len(datums))
+                span.set_attribute("loss_fn", "importance_sampling")
+                span.set_attribute("optimizer", "adam")
+                span.set_attribute("learning_rate", self.adam_params.learning_rate)
+                try:
+                    fwd_bwd_future = self.training_client.forward_backward(datums, loss_fn="importance_sampling")
+                    optim_future = self.training_client.optim_step(self.adam_params) 
+                    fwd_bwd_future.result()
+                    optim_future.result()
+                except Exception as exc:
+                    span.record_exception(exc)
+                    span.set_attribute("error", True)
+                    raise
             
     def prompt(self, question):
         result = self.sampling_client.sample(
@@ -475,17 +591,18 @@ class Model:
 
 
 if __name__ == "__main__":
-    # session = px.launch_app()
-    # print(f"Phoenix UI: {session.url}")
-    # register(
-    #     project_name="spreadsheet-agent-benchmark",
-    #     endpoint="http://localhost:6006/v1/traces",
-    #     protocol="http/protobuf",
-    #     auto_instrument=False,
-    # )
-
+    session = setup_phoenix_tracing()
     model = Model(MODEL_NAME, RENDERER)
-    asyncio.run(model.train())
+    tracer = trace.get_tracer(__name__)
+    with tracer.start_as_current_span("tinker_agent_run") as span:
+        span.set_attribute(
+            SpanAttributes.OPENINFERENCE_SPAN_KIND,
+            OpenInferenceSpanKindValues.AGENT.value,
+        )
+        span.set_attribute("agent.name", "spreadsheet-agent-benchmark-tinker")
+        span.set_attribute("llm.model_name", MODEL_NAME)
+        span.set_attribute("renderer", RENDERER)
+        asyncio.run(model.train())
     # model.prompt("A 10 kg body moving at sticks to a 15 kg body at rest. What is the final velocity?")
     input("Training complete. Press Enter to shut down Phoenix and exit...")
     
