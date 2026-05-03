@@ -1,6 +1,6 @@
 import json
 import re
-from credit_limit_policy import grade_overextended_partial
+from tinker.credit_limit_policy import grade_overextended_partial
 
 class Grader:
 

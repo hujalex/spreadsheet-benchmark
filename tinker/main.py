@@ -21,8 +21,8 @@ from phoenix.otel import register
 from opentelemetry import trace
 from openinference.semconv.trace import OpenInferenceSpanKindValues, SpanAttributes
 
-from credit_limit_policy import find_overextended_accounts, grade_overextended, _parse_pairs
-from grader import Grader
+from tinker.credit_limit_policy import find_overextended_accounts, grade_overextended, _parse_pairs
+from tinker.grader import Grader
 
 METRICS_DIR = "metrics"
 
