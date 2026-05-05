@@ -89,6 +89,8 @@ Each task is evaluated independently:
 
 The final benchmark score is the average performance across all three tasks.
 
+---
+
 ## Data
 
 Kaggle Financial Transactions Dataset: https://www.kaggle.com/datasets/computingvictor/transactions-fraud-datasets
@@ -97,6 +99,6 @@ Kaggle Financial Transactions Dataset: https://www.kaggle.com/datasets/computing
 
 ## Results
 
-tinker metrics and failures: [tinker/metrics/training_failures_latest.md](Tinker Metrics & Failures)
+Tinker Metrics and Failures: [tinker/metrics/training_failures_latest.md](Tinker Metrics & Failures)
 
-openai metrics and failures:
+OpenAi Metrics and Failures:
