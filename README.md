@@ -99,6 +99,6 @@ Kaggle Financial Transactions Dataset: https://www.kaggle.com/datasets/computing
 
 ## Results
 
-Tinker Metrics and Failures: [Latest Model Failures](https://github.com/hujalex/spreadsheet-benchmark/blob/main/tinker/metrics/training_failures_latest.md) 
+**Qwen3.6** Metrics and Failures: [Latest Model Failures](https://github.com/hujalex/spreadsheet-benchmark/blob/main/tinker/metrics/training_failures_latest.md) 
 
-OpenAI Metrics and Failures: [Latest Model Failures](https://github.com/hujalex/spreadsheet-benchmark/blob/main/openai/metrics_openai/training_failures_latest.md)
+**GPT-5.5** Metrics and Failures: [Latest Model Failures](https://github.com/hujalex/spreadsheet-benchmark/blob/main/openai/metrics_openai/training_failures_latest.md)
