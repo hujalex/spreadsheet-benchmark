@@ -97,7 +97,7 @@ class Model:
             )
 
         metrics.write(METRICS_DIR)
-        failures.write_markdown(os.path.join(METRICS_DIR, "rubric.md"))
+        failures.write_markdown(os.path.join(METRICS_DIR, "training_failures_latest.md"))
 
     def _grade_and_pack(self, step, examples, sample_results, failures, metrics):
         datums: list[tinker.Datum] = []

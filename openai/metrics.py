@@ -106,7 +106,7 @@ def annotate_failure(ex: dict, response: str) -> str:
 
 def write_failures_markdown(failures: list[dict]) -> None:
     os.makedirs(METRICS_DIR, exist_ok=True)
-    md_path = os.path.join(METRICS_DIR, "rubric.md")
+    md_path = os.path.join(METRICS_DIR, "training_failures_latest.md")
     by_task: dict[str, list[dict]] = {}
     for f in failures:
         by_task.setdefault(f["task"], []).append(f)
