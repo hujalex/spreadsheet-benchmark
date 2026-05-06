@@ -101,20 +101,20 @@ Kaggle Financial Transactions Dataset: https://www.kaggle.com/datasets/computing
 
 **Qwen3.6** Metrics and Failures: [Latest Model Failures](https://github.com/hujalex/spreadsheet-benchmark/blob/main/tinker/metrics/training_failures_latest.md) from a total of 400 Trials per each task (merge, memo, or policy)
 
-**GPT-5.5** Metrics and Failures: [Latest Model Failures](https://github.com/hujalex/spreadsheet-benchmark/blob/main/openai/metrics_openai/training_failures_latest.md) from a total of 80 Trials per task (merge, memo, or policy)
+**GPT-5.5** Metrics and Failures: [Latest Model Failures](https://github.com/hujalex/spreadsheet-benchmark/blob/main/openai/metrics_openai/training_failures_latest.md) from a total of 80 Trials per task (merge, memo, or policy). Note: Trials reduced to prevent rate-limiting
 
 ---
 
 ## Setup
 
-To run the environments, establish credentials
+Establish credentials
 ```
-EXPORT TINKER_API_KEY = 'YOUR-TINKER-API-KEY'
+export TINKER_API_KEY = 'YOUR-TINKER-API-KEY'
 ```
 or create a tinker/.env file with your Tinker API KEY
 
 ```
-EXPORT OPENAI_API_KEY = 'YOUR-OPENAI-API-KEY'
+export OPENAI_API_KEY = 'YOUR-OPENAI-API-KEY'
 ```
 or create an openai/.env file with your OpenAI API KEY
 
