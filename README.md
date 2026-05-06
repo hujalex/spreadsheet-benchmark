@@ -82,7 +82,7 @@ The memo can be written in any style; the grader will extract the boxed values f
 
 ## Scoring
 
-Each task is evaluated independently:
+Each task is evaluated independently and normalized from 0 to 1:
 - **Task 1:** Binary (0 or 1)
 - **Task 2:** Per-account scoring (sum of +1/+0/-1)
 - **Task 3:** 0, 0.5, or 1.0
@@ -99,6 +99,6 @@ Kaggle Financial Transactions Dataset: https://www.kaggle.com/datasets/computing
 
 ## Results
 
-**Qwen3.6** Metrics and Failures: [Latest Model Failures](https://github.com/hujalex/spreadsheet-benchmark/blob/main/tinker/metrics/training_failures_latest.md) 
+**Qwen3.6** Metrics and Failures: [Latest Model Failures](https://github.com/hujalex/spreadsheet-benchmark/blob/main/tinker/metrics/training_failures_latest.md) from a total of 400 Trials per each task (merge, memo, or policy)
 
-**GPT-5.5** Metrics and Failures: [Latest Model Failures](https://github.com/hujalex/spreadsheet-benchmark/blob/main/openai/metrics_openai/training_failures_latest.md)
+**GPT-5.5** Metrics and Failures: [Latest Model Failures](https://github.com/hujalex/spreadsheet-benchmark/blob/main/openai/metrics_openai/training_failures_latest.md) from a total of 80 Trials per task (merge, memo, or policy)
