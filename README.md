@@ -82,7 +82,7 @@ The memo can be written in any style; the grader will extract the boxed values f
 
 ## Scoring
 
-Each task is evaluated independently and normalized from 0 to 1:
+Each task is evaluated independently and normalized from 0 to 1 if applicable:
 - **Task 1:** Binary (0 or 1)
 - **Task 2:** Per-account scoring (sum of +1/+0/-1)
 - **Task 3:** 0, 0.5, or 1.0
