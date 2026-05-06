@@ -6,7 +6,7 @@ load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # RFT-eligible reasoning model. Swap to whichever RFT-supported model you have.
-MODEL_NAME = os.getenv("OPENAI_RFT_MODEL", "o4-mini-2025-04-16")
+MODEL_NAME = os.getenv("OPENAI_RFT_MODEL", "gpt-5.5-2026-04-23")
 PHOENIX_PROJECT_NAME = os.getenv("PHOENIX_PROJECT_NAME", "spreadsheet-agent-benchmark-openai")
 PHOENIX_ENDPOINT = os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006/v1/traces")
 
